@@ -1,10 +1,19 @@
 {
   "id": "testexpansion",
-  "name": "Test Expansion",
+  "name": "Gif Expansion",
   "prompts": [
-    "You're my soda pop, my little soda pop"
+      "Your great aunt just passed away. LOL 😂"
   ],
   "responses": [
-    "gonna be gonna be golden"
+    "https://media1.tenor.com/m/u5uXD3icJ1kAAAAC/simpsons-homer-simpson.gif",
+    "https://media3.giphy.com/media/gtakVlnStZUbe/giphy.webp",
+    "https://media1.giphy.com/media/kaq6GnxDlJaBq/giphy.webp",
+    "https://media2.giphy.com/media/kKdgdeuO2M08M/200.webp",
+    "https://media1.giphy.com/media/RILsqUte1MME7TzQJ9/giphy.webp",
+    "https://media2.giphy.com/media/NEvPzZ8bd1V4Y/giphy.webp",
+    "https://media3.giphy.com/media/g9582DNuQppxC/giphy.webp",
+    "https://media1.tenor.com/m/KF0cTkqYbN0AAAAC/kermit-kermit-the-frog.gif",
+    "https://media2.giphy.com/media/v1.Y2lkPTc5MGI3NjExdXVwajVjYzNqMjQ0ZHdmbGE3ZndpdG51aGRyemZuaTFzZXJydHVvMiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/5VKbvrjxpVJCM/giphy.gif",
+    "https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExOHptdXJ5cm1ueTlrNThmZjV4am5rc283eG1rYWd4aTlsbmdqNnp4MiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/JTzPN5kkobFv7X0zPJ/giphy.gif"
   ]
 }
