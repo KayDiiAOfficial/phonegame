@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>New Phone Game</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>New Phone Game</h1>
+      <div id="roomInfo"></div>
+    </header>
+
+    <section id="auth">
+      <div class="card">
+        <label>Display name</label>
+        <input id="nameInput" placeholder="Your name" maxlength="24"/>
+
+        <!-- Deck selection (populated by client.js from server "decks" event) -->
+        <div class="card" id="deckBox" style="margin-top:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <h3 style="margin:0">Decks</h3>
+            <div class="row" style="margin:0">
+              <button id="btnAllDecks" class="secondary" type="button">Check all</button>
+              <button id="btnNoneDecks" class="secondary" type="button">Uncheck all</button>
+            </div>
+          </div>
+          <div id="deckList" class="deckList"></div>
+          <p class="muted" style="margin-top:8px">By default, only the <strong>Default</strong> deck is selected.</p>
+        </div>
+
+        <div class="row" style="margin-top:16px">
+          <button id="btnCreate">Create Room</button>
+          <input id="joinCode" placeholder="ROOM" maxlength="4" class="code"/>
+          <button id="btnJoin">Join</button>
+        </div>
+        <p class="muted">Share the 4-letter room code with friends.</p>
+      </div>
+    </section>
+
+    <section id="lobby" class="hidden">
+      <div class="card">
+        <h2>Lobby</h2>
+        <p>Room Code: <span id="roomCode" class="codeBig"></span></p>
+        <div id="players"></div>
+        <button id="btnStart" class="primary">Start Round</button>
+      </div>
+    </section>
+
+    <section id="game" class="hidden">
+      <div class="board">
+        <!-- Left: phone -->
+        <div class="phoneWrap">
+          <div class="phone">
+            <div class="notch"></div>
+            <div class="screen">
+              <div class="statusRow">
+                <div>📶 5G</div>
+                <div id="phaseBadge" class="badge">—</div>
+                <div>🕒</div>
+              </div>
+              <div class="contactBar">
+                <div class="contactName" id="contactName">—</div>
+                <div class="contactStatus">iMessage</div>
+              </div>
+
+              <div class="chat">
+                <div id="prompt" class="bubble prompt">—</div>
+                <div id="responses"></div>
+              </div>
+
+              <div class="actions">
+                <button id="btnReveal" class="secondary hidden">Next response ▶</button>
+                <button id="btnForceStart" class="secondary hidden">Force start ▶</button>
+                <div id="voteHint" class="muted hidden">Tap a response to vote.</div>
+              </div>
+
+            </div>
+          </div>
+        </div>
+
+        <!-- Right: hand (drawer on mobile, static on desktop) -->
+        <aside id="sidePanel" class="sidePanel" aria-label="Player panel">
+          <div class="handWrap">
+            <div class="drawerHeader mobileOnly">
+              <div class="title">Your Hand</div>
+              <button id="btnCloseDrawer" class="drawerClose" aria-label="Close panel">✕</button>
+            </div>
+
+            <h3 class="desktopOnly">Your Hand</h3>
+
+            <div class="handSection">
+              <div id="handText" class="hand handText"></div>
+
+              <!-- Hidden unless you have media cards -->
+              <div id="handMediaWrap" class="handMediaWrap hidden">
+                <div class="handMediaTitle">Media</div>
+                <div id="handMedia" class="handMedia"></div>
+              </div>
+            </div>
+
+            <div class="row">
+              <button id="btnStartFromGame" class="primary hidden">Start Next Round</button>
+            </div>
+            <div id="leaderboard"></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </div>
+
+  <!-- Mobile floating toggle + backdrop -->
+  <button id="btnToggleDrawer" class="fab mobileOnly" aria-expanded="false" aria-controls="sidePanel">
+    ☰ Hand
+  </button>
+  <div id="drawerBackdrop" class="drawerBackdrop hidden" aria-hidden="true"></div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <audio id="sfxPrompt" src="sounds/prompt.mp3" preload="auto"></audio>
+  <audio id="sfxReveal" src="sounds/reveal.mp3" preload="auto"></audio>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="client.js"></script>
+</body>
+</html>
