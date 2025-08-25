@@ -5,7 +5,11 @@ import { getFreshDeck, loadDecks, watchDecks, listDecks } from "./deck.js";
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  // slightly more tolerant mobile keepalive
+  pingInterval: 25000,
+  pingTimeout: 30000
+});
 
 const PORT = process.env.PORT || 3000;
 app.use(express.static("public"));
@@ -19,7 +23,23 @@ server.listen(PORT, () => {
 // -------------------- Game Logic --------------------
 
 const MAX_HAND = 7;
+const DISCONNECT_GRACE_MS = 45000; // wait before removing a player (mobile resume window)
 const rooms = {}; // code -> room state
+
+function shuffle(arr){
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i+1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function prepareReveal(room){
+  // randomize reveal order by shuffling submissions array
+  room.submissions = shuffle(room.submissions);
+  room.phase = "reveal";
+  room.revealIndex = -1; // host sees "Start reveal ▶"
+}
 
 function generateRoomCode() {
   const chars = "ABCDEFGHJKMNPQRSTUWXYZ23456789";
@@ -28,55 +48,8 @@ function generateRoomCode() {
   return rooms[code] ? generateRoomCode() : code;
 }
 
-function shuffle(a){ for (let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
 function freshRoomDeck(selectedDecks) {
   return getFreshDeck(selectedDecks && selectedDecks.length ? selectedDecks : ["default"]);
-}
-
-function createRoom(hostSocket, name, selectedDecks) {
-  const code = generateRoomCode();
-  const deck = freshRoomDeck(selectedDecks);
-  rooms[code] = {
-    code,
-    hostId: hostSocket.id,
-    phase: "lobby", // lobby|submit|reveal|vote|score
-    round: 0,
-    prompt: null,
-    revealIndex: 0,
-    revealShuffled: false,
-    submissions: [], // {id, playerId, parts:[rawCard], votes}
-    resultsSnapshot: null, // <-- NEW: stable snapshot for score phase
-    players: {},     // socketId -> {id, name, score, hand:[], submittedParts:null, hasVoted:false, votedFor:null}
-    deck,
-    selectedDecks: (selectedDecks && selectedDecks.length) ? selectedDecks : ["default"],
-  };
-  rooms[code].players[hostSocket.id] = {
-    id: hostSocket.id,
-    name: name?.trim() || "Host",
-    score: 0,
-    hand: drawResponses(rooms[code], MAX_HAND),
-    submittedParts: null,
-    submittedCard: null, // legacy
-    hasVoted: false,
-    votedFor: null,
-  };
-  return rooms[code];
-}
-
-function joinRoom(code, socket, name) {
-  const room = rooms[code];
-  if (!room) return { error: "Room not found" };
-  room.players[socket.id] = {
-    id: socket.id,
-    name: name?.trim() || `Player ${Object.keys(room.players).length + 1}`,
-    score: 0,
-    hand: drawResponses(room, MAX_HAND),
-    submittedParts: null,
-    submittedCard: null,
-    hasVoted: false,
-    votedFor: null,
-  };
-  return { room };
 }
 
 function drawResponses(room, count) {
@@ -89,7 +62,6 @@ function drawResponses(room, count) {
   }
   return out;
 }
-
 function drawPrompt(room) {
   if (room.deck.prompts.length === 0) {
     room.deck.prompts = freshRoomDeck(room.selectedDecks).prompts;
@@ -103,18 +75,10 @@ function getPlayerList(room) {
   }));
 }
 
-function deepEqual(a, b) { try { return JSON.stringify(a) === JSON.stringify(b); } catch { return false; } }
-function isImageLink(str){
-  if (typeof str !== "string") return false;
-  try {
-    const u = new URL(str.trim());
-    if (!/^https?:$/.test(u.protocol)) return false;
-    return /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(u.pathname);
-  } catch { return false; }
-}
 function hasSubmitted(p){
   return (Array.isArray(p.submittedParts) && p.submittedParts.length > 0) || p.submittedCard !== null;
 }
+function deepEqual(a, b) { try { return JSON.stringify(a) === JSON.stringify(b); } catch { return false; } }
 function findAndRemoveFromHand(hand, card){
   const idx = hand.findIndex(c => (c === card) || deepEqual(c, card));
   if (idx === -1) return false;
@@ -122,57 +86,31 @@ function findAndRemoveFromHand(hand, card){
   return true;
 }
 
-function ensureRevealShuffled(room){
-  if (!room.revealShuffled) {
-    shuffle(room.submissions);     // randomize reveal & voting order
-    room.revealShuffled = true;
-  }
-}
-
-// NEW: create a stable results array for score phase
-function snapshotResults(room){
-  room.resultsSnapshot = room.submissions.map(s => ({
-    id: s.id, playerId: s.playerId, parts: s.parts, votes: s.votes
-  }));
-}
-
-function proceedToVoteOrScore(room) {
-  if (room.submissions.length <= 1) {
-    // Directly to score, make sure snapshot exists
-    snapshotResults(room);
-    room.phase = "score";
-    room.revealIndex = -1;
-  } else {
-    room.phase = "vote";
-    resetVotes(room);
-  }
-}
-
 function getPublicState(room, viewerId) {
   const you = room.players[viewerId];
+  const isHost = room.hostId === viewerId;
 
   let submissionsPublic = [];
   if (room.phase === "reveal") {
-    if (room.revealIndex >= 0 && room.revealIndex < room.submissions.length) {
+    // Show only the CURRENT item while revealing
+    if (room.revealIndex >= 0) {
       const s = room.submissions[room.revealIndex];
-      submissionsPublic = [{ id: s.id, parts: s.parts, isYou: s.playerId === viewerId }];
+      if (s) submissionsPublic = [{ id: s.id, parts: s.parts, isYou: s.playerId === viewerId }];
     } else {
-      submissionsPublic = [];
+      submissionsPublic = []; // waiting for host to press Start reveal
     }
   } else if (room.phase === "vote") {
+    // All visible, anonymous; include isYou for client labeling only
     submissionsPublic = room.submissions.map(s => ({ id: s.id, parts: s.parts, isYou: s.playerId === viewerId }));
   } else if (room.phase === "score") {
-    // Always use the snapshot to be safe
-    const src = Array.isArray(room.resultsSnapshot) && room.resultsSnapshot.length
-      ? room.resultsSnapshot
-      : room.submissions;
-    submissionsPublic = src.map(s => ({ id: s.id, parts: s.parts, playerId: s.playerId, votes: s.votes }));
+    // Reveal authors and votes
+    submissionsPublic = room.submissions.map(s => ({ id: s.id, parts: s.parts, playerId: s.playerId, votes: s.votes }));
   }
 
   return {
     code: room.code,
     phase: room.phase,
-    isHost: room.hostId === viewerId,
+    isHost,
     round: room.round,
     prompt: room.prompt,
     revealIndex: room.revealIndex,
@@ -202,11 +140,91 @@ function resetVotes(room) {
   for (const s of room.submissions) s.votes = 0;
 }
 
+function createRoom(hostSocket, name, selectedDecks, sessionId) {
+  const code = generateRoomCode();
+  const deck = freshRoomDeck(selectedDecks);
+  rooms[code] = {
+    code,
+    hostId: hostSocket.id,
+    phase: "lobby", // lobby|submit|reveal|vote|score
+    round: 0,
+    prompt: null,
+    revealIndex: -1, // -1 = staging before first reveal
+    submissions: [], // {id, playerId, parts:[rawCard], votes}
+    players: {},     // socketId -> player
+    deck,
+    selectedDecks: (selectedDecks && selectedDecks.length) ? selectedDecks : ["default"],
+    disconnectTimers: {} // socketId -> timeout
+  };
+  rooms[code].players[hostSocket.id] = {
+    id: hostSocket.id,
+    sessionId: sessionId || null,
+    name: name?.trim() || "Host",
+    score: 0,
+    hand: drawResponses(rooms[code], MAX_HAND),
+    submittedParts: null,
+    submittedCard: null,
+    hasVoted: false,
+    votedFor: null,
+  };
+  return rooms[code];
+}
+
+function joinRoom(code, socket, name, sessionId) {
+  const room = rooms[code];
+  if (!room) return { error: "Room not found" };
+  room.players[socket.id] = {
+    id: socket.id,
+    sessionId: sessionId || null,
+    name: name?.trim() || `Player ${Object.keys(room.players).length + 1}`,
+    score: 0,
+    hand: drawResponses(room, MAX_HAND),
+    submittedParts: null,
+    submittedCard: null,
+    hasVoted: false,
+    votedFor: null,
+  };
+  return { room };
+}
+
+// Find an existing player by sessionId (returns [socketId, player] or [null,null])
+function findPlayerBySession(room, sessionId){
+  if (!sessionId) return [null, null];
+  for (const [sid, p] of Object.entries(room.players)) {
+    if (p.sessionId && p.sessionId === sessionId) return [sid, p];
+  }
+  return [null, null];
+}
+
+// Move a player from old socketId -> new socket.id (preserve scores/submissions/etc)
+function rebindPlayer(room, oldSid, socket, newName) {
+  const old = room.players[oldSid];
+  if (!old) return;
+
+  const updated = {
+    ...old,
+    id: socket.id,
+    name: newName?.trim() || old.name
+  };
+  delete room.players[oldSid];
+  room.players[socket.id] = updated;
+
+  if (room.hostId === oldSid) room.hostId = socket.id;
+
+  room.submissions.forEach(s => {
+    if (s.playerId === oldSid) s.playerId = socket.id;
+  });
+
+  const t = room.disconnectTimers[oldSid];
+  if (t) { clearTimeout(t); delete room.disconnectTimers[oldSid]; }
+}
+
 // -------------------- Socket events --------------------
 
 io.on("connection", (socket) => {
   let currentRoomCode = null;
 
+  // Send available decks to new clients (for lobby checkbox UI)
   socket.emit("decks", listDecks());
 
   function emitRoom() {
@@ -218,22 +236,46 @@ io.on("connection", (socket) => {
     }
   }
 
-  socket.on("createRoom", ({ name, decks }) => {
+  // Resume flow: called on fresh connection to reclaim previous identity
+  socket.on("resume", ({ code, name, sessionId }) => {
+    const room = rooms[code];
+    if (!room) { socket.emit("errorMsg", "Room not found."); return; }
+
+    const [oldSid, player] = findPlayerBySession(room, sessionId);
+    currentRoomCode = code;
+    socket.join(code);
+
+    if (player && oldSid && oldSid !== socket.id) {
+      rebindPlayer(room, oldSid, socket, name);
+    } else if (!player) {
+      const res = joinRoom(code, socket, name, sessionId);
+      if (res.error) { socket.emit("errorMsg", res.error); return; }
+    }
+    emitRoom();
+  });
+
+  socket.on("createRoom", ({ name, decks, sessionId }) => {
     const all = new Set(listDecks().map(d => d.id));
     const selected = (Array.isArray(decks) ? decks : []).filter(id => all.has(id));
-    const room = createRoom(socket, name, selected.length ? selected : ["default"]);
+    const room = createRoom(socket, name, selected.length ? selected : ["default"], sessionId);
     currentRoomCode = room.code;
     socket.join(room.code);
     emitRoom();
   });
 
-  socket.on("joinRoom", ({ code, name }) => {
+  socket.on("joinRoom", ({ code, name, sessionId }) => {
     const room = rooms[code];
     if (!room) { socket.emit("errorMsg", "Room not found."); return; }
     currentRoomCode = code;
     socket.join(code);
-    const res = joinRoom(code, socket, name);
-    if (res.error) { socket.emit("errorMsg", res.error); return; }
+
+    const [oldSid, player] = findPlayerBySession(room, sessionId);
+    if (player && oldSid) {
+      rebindPlayer(room, oldSid, socket, name);
+    } else {
+      const res = joinRoom(code, socket, name, sessionId);
+      if (res.error) { socket.emit("errorMsg", res.error); return; }
+    }
     emitRoom();
   });
 
@@ -252,9 +294,7 @@ io.on("connection", (socket) => {
     room.round += 1;
     room.phase = "submit";
     room.prompt = drawPrompt(room);
-    room.revealIndex = 0;
-    room.revealShuffled = false;
-    room.resultsSnapshot = null;
+    room.revealIndex = -1; // wait for host to begin reveal
     room.submissions = [];
     for (const p of Object.values(room.players)) {
       while (p.hand.length < MAX_HAND) p.hand.push(...drawResponses(room, 1));
@@ -266,7 +306,7 @@ io.on("connection", (socket) => {
     emitRoom();
   });
 
-  // Legacy one-card submit
+  // Legacy one-card submit (still supported)
   socket.on("submitCard", (card) => {
     if (!currentRoomCode) return;
     const room = rooms[currentRoomCode];
@@ -275,21 +315,19 @@ io.on("connection", (socket) => {
     if (!p || hasSubmitted(p)) return;
     if (!findAndRemoveFromHand(p.hand, card)) return;
 
-    const kind = (typeof card === "string" && isImageLink(card)) ? "image" : "text";
+    const kind = (typeof card === "string" && /^https?:\/\//.test(card)) ? "image" : "text";
     p.submittedParts = [{ kind, card }];
     p.submittedCard = card;
 
     room.submissions.push({ id: room.submissions.length + 1, playerId: p.id, parts: [card], votes: 0 });
 
-    if (everyoneSubmitted(room)) {
-      room.phase = "reveal";
-      room.revealIndex = -1;   // paused
-      ensureRevealShuffled(room);
-    }
+    // If everyone is in, stage reveal for host (shuffled)
+    if (everyoneSubmitted(room)) prepareReveal(room);
+
     emitRoom();
   });
 
-  // New combo submit
+  // New: combo submit (1–2 parts)
   socket.on("submitParts", ({ parts }) => {
     if (!currentRoomCode) return;
     const room = rooms[currentRoomCode];
@@ -323,45 +361,55 @@ io.on("connection", (socket) => {
       votes: 0
     });
 
-    if (everyoneSubmitted(room)) {
-      room.phase = "reveal";
-      room.revealIndex = -1;   // paused
-      ensureRevealShuffled(room);
-    }
+    // If everyone is in, stage reveal for host (shuffled)
+    if (everyoneSubmitted(room)) prepareReveal(room);
+
     emitRoom();
   });
 
-  socket.on("forceStartReveal", () => {
-    if (!currentRoomCode) return;
-    const room = rooms[currentRoomCode];
-    if (!room || room.hostId !== socket.id) return;
-    if (room.phase !== "submit") return;
-    if (room.submissions.length === 0) {
-      socket.emit("errorMsg", "No submissions yet to reveal.");
-      return;
-    }
-    room.phase = "reveal";
-    room.revealIndex = -1; // paused; host must press Next
-    ensureRevealShuffled(room);
-    emitRoom();
-  });
-
+  // Host: begin/continue reveal
   socket.on("revealNext", () => {
     if (!currentRoomCode) return;
     const room = rooms[currentRoomCode];
-    if (room.phase !== "reveal") return;
+    if (room.phase !== "reveal" && room.phase !== "submit") return;
     if (room.hostId !== socket.id) return;
 
-    if (room.revealIndex === -1 && room.submissions.length > 0) {
-      room.revealIndex = 0; // show first
-    } else if (room.revealIndex < room.submissions.length - 1) {
-      room.revealIndex += 1;
+    // If still in submit, start reveal now (shuffled, staged)
+    if (room.phase === "submit") {
+      if (room.submissions.length === 0) return; // nothing to reveal
+      prepareReveal(room); // sets phase="reveal" and revealIndex=-1
+    }
+
+    if (room.revealIndex < room.submissions.length - 1) {
+      room.revealIndex += 1; // -1→0 (first), 0→1, ...
     } else {
-      proceedToVoteOrScore(room);
+      // if only one submission, skip vote -> score
+      if (room.submissions.length <= 1) {
+        for (const s of room.submissions) {
+          const target = room.players[s.playerId];
+          if (target) target.score += s.votes;
+        }
+        room.phase = "score";
+      } else {
+        room.phase = "vote";
+        resetVotes(room);
+      }
     }
     emitRoom();
   });
 
+  // Host: force start reveal (even if not everyone submitted)
+  socket.on("forceStartReveal", () => {
+    if (!currentRoomCode) return;
+    const room = rooms[currentRoomCode];
+    if (room.hostId !== socket.id) return;
+    if (room.phase !== "submit") return;
+    if (room.submissions.length === 0) { socket.emit("errorMsg","No submissions yet."); return; }
+    prepareReveal(room); // shuffle + stage at -1
+    emitRoom();
+  });
+
+  // Voting
   socket.on("castVote", (submissionId) => {
     if (!currentRoomCode) return;
     const room = rooms[currentRoomCode];
@@ -378,18 +426,16 @@ io.on("connection", (socket) => {
     voter.votedFor = submissionId;
 
     if (everyoneVoted(room)) {
-      // Tally -> score, keep everything visible
       for (const s of room.submissions) {
         const target = room.players[s.playerId];
         if (target) target.score += s.votes;
       }
-      snapshotResults(room);  // <-- make sure score has stable data
       room.phase = "score";
-      room.revealIndex = -1;
     }
     emitRoom();
   });
 
+  // Next round
   socket.on("nextRound", () => {
     if (!currentRoomCode) return;
     const room = rooms[currentRoomCode];
@@ -398,9 +444,7 @@ io.on("connection", (socket) => {
 
     room.phase = "submit";
     room.prompt = drawPrompt(room);
-    room.revealIndex = 0;
-    room.revealShuffled = false;
-    room.resultsSnapshot = null;
+    room.revealIndex = -1;
     room.submissions = [];
     for (const p of Object.values(room.players)) {
       while (p.hand.length < MAX_HAND) p.hand.push(...drawResponses(room, 1));
@@ -412,19 +456,48 @@ io.on("connection", (socket) => {
     emitRoom();
   });
 
+  // Leave room (explicit)
+  socket.on("leaveRoom", () => {
+    if (!currentRoomCode) { socket.emit("leftRoom"); return; }
+    const room = rooms[currentRoomCode];
+    if (room) {
+      delete room.players[socket.id];
+      if (room.hostId === socket.id) {
+        const ids = Object.keys(room.players);
+        room.hostId = ids[0] || null;
+      }
+      if (Object.keys(room.players).length === 0) {
+        delete rooms[currentRoomCode];
+      } else {
+        emitRoom();
+      }
+    }
+    currentRoomCode = null;
+    socket.emit("leftRoom");
+  });
+
+  // Disconnect with grace period
   socket.on("disconnect", () => {
     if (!currentRoomCode) return;
     const room = rooms[currentRoomCode];
     if (!room) return;
-    delete room.players[socket.id];
-    if (room.hostId === socket.id) {
-      const ids = Object.keys(room.players);
-      room.hostId = ids[0] || null;
-    }
-    if (Object.keys(room.players).length === 0) {
-      delete rooms[currentRoomCode];
-    } else {
-      emitRoom();
-    }
+
+    room.disconnectTimers[socket.id] = setTimeout(() => {
+      const p = room.players[socket.id];
+      if (!p) return;
+      delete room.players[socket.id];
+
+      if (room.hostId === socket.id) {
+        const ids = Object.keys(room.players);
+        room.hostId = ids[0] || null;
+      }
+
+      if (Object.keys(room.players).length === 0) {
+        delete rooms[currentRoomCode];
+      } else {
+        emitRoom();
+      }
+      delete room.disconnectTimers[socket.id];
+    }, DISCONNECT_GRACE_MS);
   });
 });
