@@ -3,7 +3,16 @@ const inferServerURL = () => {
   const isHttp = location.protocol === "http:" || location.protocol === "https:";
   return isHttp ? undefined : (window.SOCKET_URL || "http://localhost:3000");
 };
-const socket = io(inferServerURL());
+
+// more robust mobile reconnection
+const socket = io(inferServerURL(), {
+  transports: ["websocket"],           // prefer WS
+  reconnection: true,
+  reconnectionAttempts: Infinity,
+  reconnectionDelay: 500,
+  reconnectionDelayMax: 3000,
+  timeout: 20000
+});
 
 // Elements
 const $auth = document.getElementById("auth");
@@ -44,17 +53,17 @@ const $chat = document.querySelector(".chat");
 // NEW: Force start button (added in HTML actions bar)
 const $btnForceStart = document.getElementById("btnForceStart");
 
+// NEW: Leave game (we’ll create the button if it doesn’t exist)
+let $btnLeave = document.getElementById("btnLeave");
+
 // Keeps a fallback copy of all responses for the Score screen if needed
 let cacheAllForScore = null;
 
-
 // Mobile Drawer
-
 const $sidePanel = document.getElementById("sidePanel");
 const $btnToggleDrawer = document.getElementById("btnToggleDrawer");
 const $btnCloseDrawer = document.getElementById("btnCloseDrawer");
 const $drawerBackdrop = document.getElementById("drawerBackdrop");
-
 
 // --- SFX ---
 const $sfxPrompt = document.getElementById("sfxPrompt");
@@ -88,6 +97,19 @@ function toast(msg){
   setTimeout(()=> $toast.classList.add("hidden"), 1800);
 }
 function upcaseCode(v){ return (v || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0,4); }
+
+function softResetUI(){
+  // go back to auth view locally; server will also send "state" once you join again
+  $auth.classList.remove("hidden");
+  $lobby.classList.add("hidden");
+  $game.classList.add("hidden");
+  $roomInfo.textContent = "";
+  $roomCode.textContent = "";
+  $responses.innerHTML = "";
+  $prompt.textContent = "—";
+  pick = { textIndex:null, imageIndex:null };
+  cacheAllForScore = null;
+}
 
 // Detect image/gif link
 function isImageLink(str){
@@ -135,7 +157,7 @@ function parsePrompt(p){
 
   if (typeof p === "object"){
     const from = p.from || "Unknown";
-    const parsed = parseCardContent(p);   // keep caption
+    const parsed = parseCardContent(p);
     return { from, ...parsed };
   }
 
@@ -159,6 +181,7 @@ function createImageEl(src, className){
   return img;
 }
 
+// Drawer helpers
 function openDrawer(){
   document.body.classList.add("drawerOpen");
   $btnToggleDrawer?.setAttribute("aria-expanded", "true");
@@ -173,7 +196,6 @@ function toggleDrawer(){
   if (document.body.classList.contains("drawerOpen")) closeDrawer();
   else openDrawer();
 }
-
 
 // Auto-scroll if near bottom
 function autoScrollIfNearBottom(){
@@ -200,7 +222,7 @@ function buildReplyBubble(rawContent, { voteable=false, selected=false } = {}){
   return div;
 }
 
-// Append one response "message" which might be multiple parts now (image + text)
+// Append one response "message" which might be multiple parts (image + text)
 function appendReplyParts(container, parts, {
   voteable=false,
   selected=false,
@@ -323,7 +345,7 @@ function submitPicked(){
   if (!parts.length) return;
 
   socket.emit("submitParts", { parts });
-  closeDrawer();
+  closeDrawer(); // mobile UX
   // lock UI
   pick = { textIndex:null, imageIndex:null };
   renderHandControls("locked", true);
@@ -389,6 +411,7 @@ $btnStartFromGame.addEventListener("click", () => socket.emit("startRound"));
 $btnReveal.addEventListener("click", () => socket.emit("revealNext"));
 $btnForceStart?.addEventListener("click", () => socket.emit("forceStartReveal"));
 
+// Drawer toggles
 $btnToggleDrawer?.addEventListener("click", toggleDrawer);
 $btnCloseDrawer?.addEventListener("click", closeDrawer);
 $drawerBackdrop?.addEventListener("click", closeDrawer);
@@ -396,6 +419,30 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeDrawer();
 });
 
+// Leave button (created inside actions bar if needed)
+function ensureLeaveButton(){
+  if ($btnLeave) return $btnLeave;
+  const actions = document.querySelector(".actions");
+  if (!actions) return null;
+  $btnLeave = document.createElement("button");
+  $btnLeave.id = "btnLeave";
+  $btnLeave.className = "secondary";
+  $btnLeave.textContent = "Leave";
+  $btnLeave.style.marginLeft = "8px";
+  actions.appendChild($btnLeave);
+  $btnLeave.addEventListener("click", () => {
+    socket.emit("leaveRoom");
+    softResetUI();
+  });
+  return $btnLeave;
+}
+
+// Reconnect on visibility return (helps some mobile browsers)
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && socket.disconnected) {
+    try { socket.connect(); } catch {}
+  }
+});
 
 // --- Socket events ---
 socket.on("connect_error", (err) => {
@@ -403,6 +450,7 @@ socket.on("connect_error", (err) => {
   toast("Can't reach game server. Is it running?");
 });
 socket.on("errorMsg", msg => toast(msg));
+socket.on("leftRoom", () => softResetUI());
 
 let lastStateYou = null;
 let lastPhase = "lobby";
@@ -422,28 +470,19 @@ socket.on("state", (state) => {
     cacheAllForScore = null;
   }
 
-  // Keep a fallback copy for SCORE:
-  // - While in VOTE (authors hidden), keep parts so we can still render something
-  if (phase === "vote" && Array.isArray(submissions) && submissions.length) {
-    cacheAllForScore = submissions.map(s => ({ id: s.id, parts: s.parts, playerId: s.playerId, votes: s.votes }));
-  }
-  // - When SCORE arrives with proper authors, overwrite cache with authoritative version
-  if (phase === "score" && Array.isArray(submissions) && submissions.length) {
+  // Keep a fallback copy for SCORE
+  if ((phase === "vote" || phase === "score") && Array.isArray(submissions) && submissions.length) {
     cacheAllForScore = submissions.map(s => ({ id: s.id, parts: s.parts, playerId: s.playerId, votes: s.votes }));
   }
 
   const nameById = {};
   (players || []).forEach(p => { nameById[p.id] = p.name; });
 
-  // --- SFX triggers (compute before rendering) ---
+  // --- SFX triggers ---
   const promptKey = serializePromptKey(prompt);
-
-  // New prompt sound: entering submit OR prompt value changed while in submit
   if (phase === "submit" && (lastPhase !== "submit" || promptKey !== lastPromptKey)) {
     playSfx($sfxPrompt);
   }
-
-  // Reveal sound only when an item actually appears (revealIndex increases to >= 0)
   if (phase === "reveal" && typeof revealIndex === "number" && revealIndex >= 0 && revealIndex > lastRevealIdx) {
     playSfx($sfxReveal);
   }
@@ -456,6 +495,10 @@ socket.on("state", (state) => {
   $auth.classList.toggle("hidden", !!code);
   $lobby.classList.toggle("hidden", !(code && phase === "lobby"));
   $game.classList.toggle("hidden", !(code && phase !== "lobby"));
+
+  // Show/Hide Leave
+  const leaveBtn = ensureLeaveButton();
+  if (leaveBtn) leaveBtn.classList.toggle("hidden", !code);
 
   // Lobby
   $players.innerHTML = "";
@@ -472,11 +515,10 @@ socket.on("state", (state) => {
   const phaseLabel = { lobby:"Lobby", submit:"Pick a response", reveal:"Revealing", vote:"Vote", score:"Scores" }[phase] || phase;
   $phaseBadge.textContent = phaseLabel;
 
-  // ===== Phone prompt (image can create a second full prompt bubble for caption) =====
+  // ===== Phone prompt =====
   const parsedPrompt = parsePrompt(prompt);
   if ($contactName) $contactName.textContent = parsedPrompt.from || "Unknown";
 
-  // Ensure any extra prompt bubble from previous render is removed
   const oldExtra = document.getElementById("promptExtra");
   if (oldExtra && oldExtra.parentElement) oldExtra.parentElement.removeChild(oldExtra);
 
@@ -499,7 +541,7 @@ socket.on("state", (state) => {
   $responses.innerHTML = "";
 
   if (phase === "reveal") {
-    // Server sends only the current one; render whatever comes
+    // Server sends ONLY the current one (or none when revealIndex === -1)
     (submissions || []).forEach(s => {
       addSenderTag($responses, s.isYou ? "You" : "Someone", true);
       const parts = (Array.isArray(s.parts) && s.parts.length) ? s.parts : s.text;
@@ -520,7 +562,6 @@ socket.on("state", (state) => {
       });
     });
   } else if (phase === "reveal" && typeof revealIndex === "number" && revealIndex < 0) {
-    // Everyone's in or host forced; waiting for host to start
     $voteHint.classList.remove("hidden");
     $voteHint.textContent = isHost
       ? "All responses are in. Press Start reveal."
@@ -533,11 +574,9 @@ socket.on("state", (state) => {
   }
 
   if (phase === "score") {
-    // Prefer server-provided submissions; if empty for any reason, use our cache
     const scoreSubs = (Array.isArray(submissions) && submissions.length)
       ? submissions
       : (Array.isArray(cacheAllForScore) ? cacheAllForScore : []);
-
     scoreSubs.forEach(s => {
       const who = s.playerId ? (nameById[s.playerId] || "Unknown") : "Unknown";
       addSenderTag($responses, who, true);
